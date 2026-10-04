@@ -1,5 +1,7 @@
 # verilatorenv
 
+[English](README.md) | [日本語](README_jp.md)
+
 A pyenv-style Verilator version manager. Clone the repository, add `bin` to
 your PATH, and use the regular `verilator` command. No package manager,
 Python environment, or administrator privileges are needed for verilatorenv.
@@ -8,7 +10,7 @@ Verilator itself is built from its official GitHub release tags.
 ## Setup
 
 ```bash
-git clone <repository-url> "$HOME/.verilatorenv"
+git clone https://github.com/ryuz/verilatorenv.git "$HOME/.verilatorenv"
 export PATH="$HOME/.verilatorenv/bin:$PATH"
 ```
 
