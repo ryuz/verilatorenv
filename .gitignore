@@ -1,0 +1,9 @@
+/versions/
+/cache/
+/shims/
+/locks/
+/.rehash-lock/
+/.shims.*/
+/version
+/version.*
+/.verilator-version

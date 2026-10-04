@@ -1,0 +1,19 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y autoconf flex bison build-essential perl shellcheck
+      - name: Check Bash syntax
+        run: bash -n bin/* tests/run.sh
+      - name: Lint
+        run: shellcheck bin/* tests/run.sh
+      - name: Integration tests
+        run: bash tests/run.sh

@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERILATORENV_BIN=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+export VERILATORENV_ROOT=${VERILATORENV_ROOT:-$(dirname -- "$VERILATORENV_BIN")}
+VERILATORENV_ROOT=$(mkdir -p -- "$VERILATORENV_ROOT" && cd -- "$VERILATORENV_ROOT" && pwd -P)
+export VERILATORENV_ROOT
+
+die() { printf 'verilatorenv: %s\n' "$*" >&2; exit 1; }
+
+normalize_version() {
+    local version=${1#v}
+    [[ $version =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "invalid version: $1"
+    printf '%s\n' "$version"
+}
+
+require_version() {
+    [[ $1 == system || -x "$VERILATORENV_ROOT/versions/$1/bin/verilator" ]] ||
+        die "version '$1' is not installed (run: verilatorenv install $1)"
+}
+
+read_version_file() {
+    local line version rest
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        read -r version rest <<< "$line"
+        [[ -n ${version:-} ]] || continue
+        [[ -z ${rest:-} ]] || die "only one version per file is supported: $1"
+        normalize_version "$version"
+        return
+    done < "$1"
+    die "empty version file: $1"
+}
+
+select_version() {
+    local directory
+    if [[ -n ${VERILATORENV_VERSION:-} ]]; then
+        SELECTED_VERSION=$(normalize_version "$VERILATORENV_VERSION")
+        VERSION_ORIGIN=VERILATORENV_VERSION
+        return
+    fi
+    directory=${VERILATORENV_DIR:-$PWD}
+    directory=$(cd -- "$directory" && pwd -P) || die "cannot access directory: $directory"
+    while :; do
+        if [[ -f "$directory/.verilator-version" ]]; then
+            VERSION_ORIGIN="$directory/.verilator-version"
+            SELECTED_VERSION=$(read_version_file "$VERSION_ORIGIN")
+            return
+        fi
+        [[ $directory != / ]] || break
+        directory=$(dirname -- "$directory")
+    done
+    VERSION_ORIGIN="$VERILATORENV_ROOT/version"
+    if [[ -f $VERSION_ORIGIN ]]; then
+        SELECTED_VERSION=$(read_version_file "$VERSION_ORIGIN")
+    else
+        SELECTED_VERSION=system
+        VERSION_ORIGIN='system (default)'
+    fi
+}
+
+system_path() {
+    local entry resolved result='' separator=''
+    local -a entries
+    IFS=: read -r -a entries <<< "${PATH:-}"
+    for entry in "${entries[@]}"; do
+        resolved=$(cd -- "${entry:-.}" 2>/dev/null && pwd -P) || resolved=$entry
+        [[ $resolved != "$VERILATORENV_BIN" && $resolved != "$VERILATORENV_ROOT/shims" &&
+           $resolved != "$VERILATORENV_ROOT"/versions/*/bin ]] || continue
+        result+="$separator${entry:-.}"
+        separator=:
+    done
+    printf '%s\n' "$result"
+}
+
+locate_command() {
+    local command=$1 clean_path
+    [[ $command != */* ]] || die "expected a command name, not a path: $command"
+    require_version "$SELECTED_VERSION"
+    if [[ $SELECTED_VERSION == system ]]; then
+        clean_path=$(system_path)
+        COMMAND_PATH=$(PATH="$clean_path" command -v -- "$command") ||
+            die "command '$command' not found in system PATH"
+        [[ -f $COMMAND_PATH && -x $COMMAND_PATH ]] || die "not an executable: $COMMAND_PATH"
+    else
+        COMMAND_PATH="$VERILATORENV_ROOT/versions/$SELECTED_VERSION/bin/$command"
+        [[ -x $COMMAND_PATH && -f $COMMAND_PATH ]] || die "command '$command' not found in version '$SELECTED_VERSION'"
+    fi
+}
+
+write_version() {
+    local file=$1 version=$2 temporary
+    version=$(normalize_version "$version")
+    require_version "$version"
+    temporary=$(mktemp "${file}.XXXXXX")
+    printf '%s\n' "$version" > "$temporary"
+    mv -f -- "$temporary" "$file"
+}
+
+rehash() (
+    local temporary directory executable name shim
+    mkdir -p -- "$VERILATORENV_ROOT/shims"
+    mkdir -- "$VERILATORENV_ROOT/.rehash-lock" 2>/dev/null || die 'another rehash is running'
+    temporary=
+    trap '[[ -z $temporary ]] || rm -rf -- "$temporary"; rmdir -- "$VERILATORENV_ROOT/.rehash-lock"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    temporary=$(mktemp -d "$VERILATORENV_ROOT/.shims.XXXXXX")
+    for directory in "$VERILATORENV_ROOT"/versions/*/bin; do
+        for executable in "$directory"/*; do
+            [[ -f $executable && -x $executable ]] || continue
+            name=$(basename -- "$executable")
+            [[ $name =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ && $name != verilatorenv ]] || continue
+            printf '#!/usr/bin/env bash\nexec %q exec %q "$@"\n' "$VERILATORENV_BIN/verilatorenv" "$name" > "$temporary/$name"
+            chmod +x "$temporary/$name"
+        done
+    done
+    for shim in "$VERILATORENV_ROOT"/shims/*; do
+        [[ -f $shim ]] || continue
+        name=$(basename -- "$shim")
+        [[ -f $temporary/$name ]] || rm -f -- "$shim"
+    done
+    for shim in "$temporary"/*; do
+        [[ -f $shim ]] || continue
+        mv -f -- "$shim" "$VERILATORENV_ROOT/shims/"
+    done
+)
+
+install_version() (
+    local force=0 skip=0 version='' argument tool prefix lock work='' logfile='' jobs backup='' status=0
+    local -a configure_options make_options
+    for argument in "$@"; do
+        case "$argument" in
+            -f|--force) force=1 ;;
+            -s|--skip-existing) skip=1 ;;
+            -*) die "unknown install option: $argument" ;;
+            *) [[ -z $version ]] || die 'usage: verilatorenv install [-f|-s] VERSION'; version=$(normalize_version "$argument") ;;
+        esac
+    done
+    [[ -n $version && $version != system ]] || die 'usage: verilatorenv install [-f|-s] VERSION'
+    [[ $force == 0 || $skip == 0 ]] || die '--force and --skip-existing cannot be combined'
+    prefix="$VERILATORENV_ROOT/versions/$version"
+    mkdir -p -- "$VERILATORENV_ROOT/versions" "$VERILATORENV_ROOT/cache" "$VERILATORENV_ROOT/locks"
+    lock="$VERILATORENV_ROOT/locks/$version"
+    mkdir -- "$lock" 2>/dev/null || die "another install/uninstall of '$version' is running"
+    trap 'status=$?; if [[ -n $backup && -d $backup && ! -e $prefix ]]; then mv -- "$backup" "$prefix"; fi; [[ -z $work ]] || rm -rf -- "$work"; rmdir -- "$lock"; if [[ $status != 0 && -n $logfile ]]; then printf "verilatorenv: build failed; log: %s\n" "$logfile" >&2; fi' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ -e $prefix ]]; then
+        if [[ $skip == 1 && -x $prefix/bin/verilator ]]; then printf '%s is already installed\n' "$version"; return; fi
+        [[ $force == 1 ]] || die "version '$version' already exists (use --force to rebuild)"
+    fi
+    for tool in git autoconf make perl flex bison "${CXX:-c++}"; do
+        command -v -- "$tool" > /dev/null || die "required build tool not found: $tool"
+    done
+    jobs=${VERILATORENV_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')}
+    [[ $jobs =~ ^[1-9][0-9]*$ ]] || die 'VERILATORENV_JOBS must be a positive integer'
+    read -r -a configure_options <<< "${VERILATORENV_CONFIGURE_OPTS:-}"
+    read -r -a make_options <<< "${VERILATORENV_MAKE_OPTS:-}"
+    for argument in "${configure_options[@]}"; do
+        [[ $argument != --prefix* && $argument != --exec-prefix* ]] || die 'installation prefixes are managed by verilatorenv'
+    done
+    for argument in "${make_options[@]}"; do
+        [[ $argument != *=* && $argument != -* ]] && die 'VERILATORENV_MAKE_OPTS must contain options or variable assignments'
+        [[ $argument != DESTDIR=* && $argument != prefix=* && $argument != exec_prefix=* ]] || die 'installation prefixes are managed by verilatorenv'
+    done
+    work=$(mktemp -d "$VERILATORENV_ROOT/cache/build-$version.XXXXXX")
+    logfile=$(mktemp "$VERILATORENV_ROOT/cache/$version.XXXXXX.log")
+    printf 'Building Verilator %s (log: %s)\n' "$version" "$logfile"
+    (
+        git clone --depth 1 --branch "v$version" -- "${VERILATORENV_REPOSITORY:-https://github.com/verilator/verilator.git}" "$work/source"
+        cd -- "$work/source"
+        unset VERILATOR_ROOT
+        autoconf
+        ./configure "${configure_options[@]}" --prefix="$prefix"
+        make -j "$jobs" "${make_options[@]}"
+        make "${make_options[@]}" install DESTDIR="$work/stage"
+        [[ -x $work/stage$prefix/bin/verilator ]] || die 'build did not produce bin/verilator'
+        "$work/stage$prefix/bin/verilator" --version
+    ) 2>&1 | tee "$logfile"
+    if [[ -e $prefix ]]; then
+        backup="$work/previous"
+        mv -- "$prefix" "$backup"
+    fi
+    mv -- "$work/stage$prefix" "$prefix"
+    rehash
+    printf 'Installed Verilator %s\n' "$version"
+)
+
+uninstall_version() (
+    local force=0 version lock answer
+    if [[ ${1:-} == -f || ${1:-} == --force ]]; then force=1; shift; fi
+    [[ $# == 1 ]] || die 'usage: verilatorenv uninstall [-f|--force] VERSION'
+    version=$(normalize_version "$1")
+    [[ $version != system ]] || die 'cannot uninstall system Verilator'
+    mkdir -p -- "$VERILATORENV_ROOT/locks"
+    lock="$VERILATORENV_ROOT/locks/$version"
+    mkdir -- "$lock" 2>/dev/null || die "another install/uninstall of '$version' is running"
+    trap 'rmdir -- "$lock"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ ! -d $VERILATORENV_ROOT/versions/$version ]]; then
+        [[ $force == 1 ]] && return
+        die "version '$version' is not installed"
+    fi
+    if [[ $force == 0 ]]; then
+        read -r -p "Uninstall Verilator $version? [y/N] " answer || die 'uninstall cancelled'
+        [[ $answer == y || $answer == Y || $answer == yes ]] || die 'uninstall cancelled'
+    fi
+    rm -rf -- "$VERILATORENV_ROOT/versions/$version"
+    rehash
+    printf 'Uninstalled Verilator %s\n' "$version"
+)
+
+init_shell() {
+    local shell=${VERILATORENV_SHELL:-bash} path_only=0 argument
+    for argument in "$@"; do
+        case "$argument" in
+            -) ;;
+            --path) path_only=1 ;;
+            bash|zsh) shell=$argument ;;
+            *) die 'usage: verilatorenv init [-|--path] [bash|zsh]' ;;
+        esac
+    done
+    printf 'export VERILATORENV_ROOT=%q\n' "$VERILATORENV_ROOT"
+    printf "export PATH=%q:%q:\"\$PATH\"\n" "$VERILATORENV_ROOT/shims" "$VERILATORENV_BIN"
+    [[ $path_only == 0 ]] || return 0
+    printf 'export VERILATORENV_SHELL=%q\n' "$shell"
+    cat <<'SHELL'
+verilatorenv() {
+    local code
+    if [[ ${1:-} == shell && $# -gt 1 ]]; then
+        shift
+        code=$(command verilatorenv shell --shell-code "$@") || return
+        eval "$code"
+    else
+        command verilatorenv "$@"
+    fi
+}
+SHELL
+}
+
+help() {
+    cat <<'HELP'
+Usage: verilatorenv <command> [arguments]
+
+  install [--list | [-f|--force] [-s|--skip-existing] VERSION]
+  uninstall [-f|--force] VERSION
+  global [VERSION]          Get/set the default version
+  local [VERSION|--unset]   Get/set .verilator-version in the current directory
+  shell [VERSION|--unset]   Override the version in an initialized shell
+  versions [--bare]         List installed versions and system
+  version                  Show the selected version and its origin
+  version-name             Show the selected version
+  version-origin           Show where the selection comes from
+  which COMMAND            Show the selected executable
+  whence COMMAND           List versions containing COMMAND
+  exec COMMAND [ARGS...]   Run a command using the selected version
+  prefix [VERSION]         Show a version's installation directory
+  root                     Show the data directory
+  init [-] [bash|zsh]       Print shell initialization code
+  rehash                   Generate shims for installed executables
+  commands                 List available commands
+  help                     Show this help
+
+Selection: VERILATORENV_VERSION > nearest .verilator-version > global > system.
+HELP
+}
+
+main() {
+    local command=${1:-help} version directory executable
+    [[ $# == 0 ]] || shift
+    case "$command" in
+        help|-h|--help) help ;;
+        --version) printf 'verilatorenv 0.1.0\n' ;;
+        root) [[ $# == 0 ]] || die 'usage: verilatorenv root'; printf '%s\n' "$VERILATORENV_ROOT" ;;
+        global|local)
+            [[ $# -le 1 ]] || die "usage: verilatorenv $command [VERSION]"
+            if [[ $command == global ]]; then directory="$VERILATORENV_ROOT/version"; else directory="$PWD/.verilator-version"; fi
+            if [[ $# == 0 ]]; then
+                if [[ -f $directory ]]; then read_version_file "$directory";
+                elif [[ $command == global ]]; then printf 'system\n';
+                else die 'no local version configured'; fi
+            elif [[ $command == local && $1 == --unset ]]; then rm -f -- "$directory"
+            else write_version "$directory" "$1"; fi
+            ;;
+        version|version-name|version-origin)
+            [[ $# == 0 ]] || die "usage: verilatorenv $command"
+            select_version
+            case "$command" in
+                version) require_version "$SELECTED_VERSION"; printf '%s (set by %s)\n' "$SELECTED_VERSION" "$VERSION_ORIGIN" ;;
+                version-name) require_version "$SELECTED_VERSION"; printf '%s\n' "$SELECTED_VERSION" ;;
+                version-origin) printf '%s\n' "$VERSION_ORIGIN" ;;
+            esac
+            ;;
+        versions)
+            [[ $# == 0 || ( $# == 1 && $1 == --bare ) ]] || die 'usage: verilatorenv versions [--bare]'
+            select_version
+            while IFS= read -r version; do
+                if [[ ${1:-} == --bare ]]; then printf '%s\n' "$version"
+                elif [[ $version == "$SELECTED_VERSION" ]]; then printf '* %s (set by %s)\n' "$version" "$VERSION_ORIGIN"
+                else printf '  %s\n' "$version"; fi
+            done < <(
+                printf 'system\n'
+                for directory in "$VERILATORENV_ROOT"/versions/*; do
+                    [[ -x $directory/bin/verilator ]] || continue
+                    basename -- "$directory"
+                done | LC_ALL=C sort
+            )
+            ;;
+        which|exec)
+            [[ $# -ge 1 ]] || die "usage: verilatorenv $command COMMAND [ARGS...]"
+            [[ $command != which || $# == 1 ]] || die 'usage: verilatorenv which COMMAND'
+            select_version
+            locate_command "$1"
+            shift
+            if [[ $command == which ]]; then printf '%s\n' "$COMMAND_PATH"
+            else
+                local execution_path
+                execution_path=$(system_path)
+                [[ $SELECTED_VERSION == system ]] || execution_path="$VERILATORENV_ROOT/versions/$SELECTED_VERSION/bin:$execution_path"
+                unset VERILATOR_ROOT
+                export PATH="$execution_path"
+                exec "$COMMAND_PATH" "$@"
+            fi
+            ;;
+        prefix)
+            [[ $# -le 1 ]] || die 'usage: verilatorenv prefix [VERSION]'
+            if [[ $# == 1 ]]; then SELECTED_VERSION=$(normalize_version "$1"); else select_version; fi
+            require_version "$SELECTED_VERSION"
+            if [[ $SELECTED_VERSION == system ]]; then
+                locate_command verilator
+                dirname -- "$(dirname -- "$COMMAND_PATH")"
+            else printf '%s/versions/%s\n' "$VERILATORENV_ROOT" "$SELECTED_VERSION"; fi
+            ;;
+        whence)
+            [[ $# == 1 && $1 != */* ]] || die 'usage: verilatorenv whence COMMAND'
+            for directory in "$VERILATORENV_ROOT"/versions/*; do
+                [[ -f $directory/bin/$1 && -x $directory/bin/$1 ]] || continue
+                basename -- "$directory"
+            done
+            ;;
+        install)
+            if [[ $# == 1 && $1 == --list ]]; then
+                git ls-remote --tags --refs -- "${VERILATORENV_REPOSITORY:-https://github.com/verilator/verilator.git}" |
+                    sed -n 's@.*refs/tags/v\([0-9][0-9.]*\)$@\1@p' |
+                    LC_ALL=C sort -t . -k1,1n -k2,2n -k3,3n
+            else install_version "$@"; fi
+            ;;
+        uninstall) uninstall_version "$@" ;;
+        rehash) [[ $# == 0 ]] || die 'usage: verilatorenv rehash'; rehash ;;
+        init) init_shell "$@" ;;
+        shell)
+            if [[ $# == 0 ]]; then
+                [[ -n ${VERILATORENV_VERSION:-} ]] || die 'no shell-specific version configured'
+                printf '%s\n' "$VERILATORENV_VERSION"
+            else
+                [[ $1 == --shell-code ]] || die "shell integration is not enabled; run: eval \"\$(verilatorenv init - bash)\""
+                shift
+                [[ $# == 1 ]] || die 'usage: verilatorenv shell VERSION|--unset'
+                if [[ $1 == --unset ]]; then printf 'unset VERILATORENV_VERSION\n'
+                else version=$(normalize_version "$1"); require_version "$version"; printf 'export VERILATORENV_VERSION=%q\n' "$version"; fi
+            fi
+            ;;
+        commands)
+            printf '%s\n' commands exec global help init install local prefix rehash root shell uninstall version version-name version-origin versions whence which
+            ;;
+        *) die "unknown command '$command' (run: verilatorenv help)" ;;
+    esac
+}
+
+main "$@"
